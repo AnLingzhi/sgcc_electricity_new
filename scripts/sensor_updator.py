@@ -22,11 +22,15 @@ class SensorUpdator:
 
         if self.use_mqtt:
             self._mqtt_init()
+            logging.info(
+                f"MQTT enabled. discovery_prefix={self._discovery_prefix}, state_prefix={self._state_prefix}"
+            )
         else:
             HASS_URL = os.getenv("HASS_URL")
             HASS_TOKEN = os.getenv("HASS_TOKEN")
             self.base_url = HASS_URL[:-1] if HASS_URL.endswith("/") else HASS_URL
             self.token = HASS_TOKEN
+            logging.info("MQTT disabled. Using Homeassistant REST API.")
         self.RECHARGE_NOTIFY = os.getenv("RECHARGE_NOTIFY", "false").lower() == "true"
 
     def update_one_userid(self, user_id: str, balance: float, last_daily_date: str, last_daily_usage: float, yearly_charge: float, yearly_usage: float, month_charge: float, month_usage: float):
@@ -235,9 +239,12 @@ class SensorUpdator:
             }
             self._mqtt_client.publish(config_topic, json.dumps(config_payload), retain=True)
             self._published_configs.add(config_topic)
+            logging.info(f"MQTT discovery published: {config_topic}")
 
         self._mqtt_client.publish(state_topic, str(state), retain=True)
         self._mqtt_client.publish(attr_topic, json.dumps(attributes), retain=True)
+        logging.info(f"MQTT state published: {state_topic}")
+        logging.info(f"MQTT attributes published: {attr_topic}")
 
     def balance_notify(self, user_id, balance):
 
