@@ -206,7 +206,9 @@ class SensorUpdator:
         client = mqtt.Client(client_id=client_id, clean_session=True)
         if username:
             client.username_pw_set(username, password)
+        client.enable_logger()
         client.connect(host, port, keepalive=60)
+        client.loop_start()
         self._mqtt_client = client
 
     def _publish_mqtt_sensor(self, sensor_name, state, attributes, device_class, state_class, unit, icon):
