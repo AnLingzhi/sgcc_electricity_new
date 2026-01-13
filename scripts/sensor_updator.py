@@ -1,9 +1,12 @@
+import json
 import logging
 import os
-from datetime import datetime,timedelta
+from datetime import datetime, timedelta
+from urllib.parse import urlparse
 
 import requests
 from sympy import true
+import paho.mqtt.client as mqtt
 
 from const import *
 
@@ -11,10 +14,19 @@ from const import *
 class SensorUpdator:
 
     def __init__(self):
-        HASS_URL = os.getenv("HASS_URL")
-        HASS_TOKEN = os.getenv("HASS_TOKEN")
-        self.base_url = HASS_URL[:-1] if HASS_URL.endswith("/") else HASS_URL
-        self.token = HASS_TOKEN
+        self.use_mqtt = bool(os.getenv("MQTT_URL"))
+        self._mqtt_client = None
+        self._discovery_prefix = os.getenv("MQTT_DISCOVERY_PREFIX", "homeassistant")
+        self._state_prefix = os.getenv("MQTT_STATE_PREFIX", "sgcc_electricity")
+        self._published_configs = set()
+
+        if self.use_mqtt:
+            self._mqtt_init()
+        else:
+            HASS_URL = os.getenv("HASS_URL")
+            HASS_TOKEN = os.getenv("HASS_TOKEN")
+            self.base_url = HASS_URL[:-1] if HASS_URL.endswith("/") else HASS_URL
+            self.token = HASS_TOKEN
         self.RECHARGE_NOTIFY = os.getenv("RECHARGE_NOTIFY", "false").lower() == "true"
 
     def update_one_userid(self, user_id: str, balance: float, last_daily_date: str, last_daily_usage: float, yearly_charge: float, yearly_usage: float, month_charge: float, month_usage: float):
@@ -49,7 +61,18 @@ class SensorUpdator:
             },
         }
 
-        self.send_url(sensorName, request_body)
+        if self.use_mqtt:
+            self._publish_mqtt_sensor(
+                sensorName,
+                sensorState,
+                request_body["attributes"],
+                device_class="energy",
+                state_class="measurement",
+                unit="kWh",
+                icon="mdi:lightning-bolt",
+            )
+        else:
+            self.send_url(sensorName, request_body)
         logging.info(f"Homeassistant sensor {sensorName} state updated: {sensorState} kWh")
 
     def update_balance(self, postfix: str, sensorState: float):
@@ -67,7 +90,18 @@ class SensorUpdator:
             },
         }
 
-        self.send_url(sensorName, request_body)
+        if self.use_mqtt:
+            self._publish_mqtt_sensor(
+                sensorName,
+                sensorState,
+                request_body["attributes"],
+                device_class="monetary",
+                state_class="total",
+                unit="CNY",
+                icon="mdi:cash",
+            )
+        else:
+            self.send_url(sensorName, request_body)
         logging.info(f"Homeassistant sensor {sensorName} state updated: {sensorState} CNY")
 
     def update_month_data(self, postfix: str, sensorState: float, usage=False):
@@ -92,7 +126,18 @@ class SensorUpdator:
             },
         }
 
-        self.send_url(sensorName, request_body)
+        if self.use_mqtt:
+            self._publish_mqtt_sensor(
+                sensorName,
+                sensorState,
+                request_body["attributes"],
+                device_class="energy" if usage else "monetary",
+                state_class="measurement",
+                unit="kWh" if usage else "CNY",
+                icon="mdi:lightning-bolt" if usage else "mdi:cash",
+            )
+        else:
+            self.send_url(sensorName, request_body)
         logging.info(f"Homeassistant sensor {sensorName} state updated: {sensorState} {'kWh' if usage else 'CNY'}")
 
     def update_yearly_data(self, postfix: str, sensorState: float, usage=False):
@@ -117,7 +162,18 @@ class SensorUpdator:
                 "state_class": "total_increasing",
             },
         }
-        self.send_url(sensorName, request_body)
+        if self.use_mqtt:
+            self._publish_mqtt_sensor(
+                sensorName,
+                sensorState,
+                request_body["attributes"],
+                device_class="energy" if usage else "monetary",
+                state_class="total_increasing" if usage else "total",
+                unit="kWh" if usage else "CNY",
+                icon="mdi:lightning-bolt" if usage else "mdi:cash",
+            )
+        else:
+            self.send_url(sensorName, request_body)
         logging.info(f"Homeassistant sensor {sensorName} state updated: {sensorState} {'kWh' if usage else 'CNY'}")
 
     def send_url(self, sensorName, request_body):
@@ -133,6 +189,55 @@ class SensorUpdator:
             )
         except Exception as e:
             logging.error(f"Homeassistant REST API invoke failed, reason is {e}")
+
+    def _mqtt_init(self):
+        mqtt_url = os.getenv("MQTT_URL")
+        parsed = urlparse(mqtt_url)
+        host = parsed.hostname or mqtt_url
+        port = parsed.port or 1883
+        client_id = os.getenv("MQTT_CLIENT_ID", "sgcc_electricity")
+        username = os.getenv("MQTT_USERNAME")
+        password = os.getenv("MQTT_PASSWORD")
+
+        client = mqtt.Client(client_id=client_id, clean_session=True)
+        if username:
+            client.username_pw_set(username, password)
+        client.connect(host, port, keepalive=60)
+        self._mqtt_client = client
+
+    def _publish_mqtt_sensor(self, sensor_name, state, attributes, device_class, state_class, unit, icon):
+        if not self._mqtt_client:
+            logging.error("MQTT client is not initialized.")
+            return
+
+        object_id = sensor_name.replace("sensor.", "")
+        device_id = f"sgcc_electricity_{object_id[-4:]}"
+        config_topic = f"{self._discovery_prefix}/sensor/{device_id}/{object_id}/config"
+        state_topic = f"{self._state_prefix}/{device_id}/{object_id}/state"
+        attr_topic = f"{self._state_prefix}/{device_id}/{object_id}/attributes"
+
+        if config_topic not in self._published_configs:
+            config_payload = {
+                "name": object_id,
+                "unique_id": object_id,
+                "state_topic": state_topic,
+                "json_attributes_topic": attr_topic,
+                "device_class": device_class,
+                "state_class": state_class,
+                "unit_of_measurement": unit,
+                "icon": icon,
+                "device": {
+                    "identifiers": [device_id],
+                    "name": f"SGCC Electricity {object_id[-4:]}",
+                    "model": "sgcc_electricity",
+                    "manufacturer": "ARC-MX",
+                },
+            }
+            self._mqtt_client.publish(config_topic, json.dumps(config_payload), retain=True)
+            self._published_configs.add(config_topic)
+
+        self._mqtt_client.publish(state_topic, str(state), retain=True)
+        self._mqtt_client.publish(attr_topic, json.dumps(attributes), retain=True)
 
     def balance_notify(self, user_id, balance):
 
@@ -153,4 +258,3 @@ class SensorUpdator:
             logging.info(
             f"Check the electricity bill balance, the notification will be sent = {self.RECHARGE_NOTIFY}")
             return
-
